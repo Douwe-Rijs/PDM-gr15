@@ -86,6 +86,7 @@ def spawn_wall_with_hole(
     return body_ids
 
 def create_ceiling(thickness, walls, max_wall_dist, wall_height, min_wall_dist, wall_width):
+    body_ids = []
     col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[thickness, walls*max_wall_dist, wall_height/2])
     vis = p.createVisualShape(
         p.GEOM_BOX,
@@ -98,10 +99,12 @@ def create_ceiling(thickness, walls, max_wall_dist, wall_height, min_wall_dist, 
         baseVisualShapeIndex=vis,
         basePosition=[wall_width/2+thickness,min_wall_dist,wall_height/2]
     )
+    body_ids.append(body)
     body = p.createMultiBody(
         baseMass=0,
         baseCollisionShapeIndex=col,
         baseVisualShapeIndex=vis,
         basePosition=[-(wall_width/2+thickness),min_wall_dist,wall_height/2]
     )
-    return
+    body_ids.append(body)
+    return body_ids
