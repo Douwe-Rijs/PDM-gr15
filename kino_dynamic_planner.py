@@ -1,381 +1,215 @@
-#!/usr/bin/env python3
-"""
-Kinodynamic RRT* (double-integrator approximation for a quadcopter) in 2D.
-
-This implementation models the vehicle as a planar quadcopter-like system with state
-s = [x, y, vx, vy] and control u = [ax, ay] (bounded accelerations). The planner
-searches in state-space and forward-propagates dynamics under sampled controls to
-generate kinodynamically-feasible trajectories.
-
-Features:
-- State-space RRT* (kinodynamic): nodes contain state, parent, cost (time), control, duration
-- Forward Euler propagation of double-integrator dynamics: x'' = ax, y'' = ay
-- Bounded acceleration controls and maximum rollout duration
-- Collision checking along the continuous trajectory (sampled at small dt)
-- KD-tree for nearest-neighbor searches cached and rebuilt lazily
-- Rewiring (limited) using neighbor rollouts
-- Visualization of resulting position-space trajectory
-
-Notes / simplifications:
-- This is a 2D planar kinodynamic model (x,y) with velocity; it's a common and
-  useful approximation for quadcopter path planning while capturing dynamics.
-- For a full 6-DOF quadcopter model (attitude, thrust limits, rotor dynamics)
-  you'd replace the dynamics and control parameterization accordingly.
-
-Author: ChatGPT
-"""
-
-import math
-import random
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
-
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.spatial import KDTree
+import heapq
 
+# =============================
+# 3D AABB Obstacle
+# =============================
+class AABB:
+    def __init__(self, min_corner, max_corner):
+        self.min = np.array(min_corner)
+        self.max = np.array(max_corner)
 
-# -------------------------------
-# Dynamics: double integrator
-# -------------------------------
-# state: [x, y, vx, vy]
-# control: [ax, ay]
-# dynamics: x_dot = vx, y_dot = vy, vx_dot = ax, vy_dot = ay
+    def contains(self, p):
+        return np.all(p >= self.min) and np.all(p <= self.max)
 
+# =============================
+# Collision Checking for Trajectory
+# =============================
+def trajectory_collides(traj, obstacles):
+    """Check collision for a trajectory (Nx6 array of states or Nx3 positions).
 
-def propagate(state: np.ndarray, control: np.ndarray, duration: float, dt: float) -> List[np.ndarray]:
-    """Forward-integrate the double-integrator dynamics using Euler integration.
-    Returns the list of states along the trajectory (including initial and final).
-    state: shape (4,), control: shape (2,)
+    The trajectory may be:
+    - array of states shape (N,6) where columns 0..2 are positions, or
+    - array of positions shape (N,3).
     """
-    steps = max(1, int(math.ceil(duration / dt)))
-    s = state.copy()
-    print(s, s.shape)
-    traj = [s.copy()]
+    if traj.size == 0:
+        return False
+    arr = np.asarray(traj)
+    if arr.ndim != 2:
+        raise ValueError("traj must be a 2D array")
+    if arr.shape[1] == 6:
+        points = arr[:, :3]
+    elif arr.shape[1] == 3:
+        points = arr
+    else:
+        raise ValueError("traj rows must have length 3 (pos) or 6 (state)")
+
+    for p in points:
+        for obs in obstacles:
+            if obs.contains(p):
+                return True
+    return False
+
+# =============================
+# State Propagation (3D Kinodynamic)
+# =============================
+def propagate(state, control, dt=0.05, steps=20):
+    """Propagate a full 6D state under constant control (ax,ay,az).
+
+    state: array-like length 6: [x,y,z,vx,vy,vz]
+    control: array-like length 3: [ax,ay,az]
+    returns (trajectory as (steps,6) array, final_state (6,))
+    """
+    traj = []
+    s = np.array(state, dtype=float)
+    ax, ay, az = control
     for _ in range(steps):
-        # derivatives
-        s[0] += s[2] * dt
-        s[1] += s[3] * dt
-        s[2] += control[0] * dt
-        s[3] += control[1] * dt
-        traj.append(s.copy())
-    return traj
+        px, py, pz, vx, vy, vz = s
+
+        # update velocity
+        vx2 = vx + ax * dt
+        vy2 = vy + ay * dt
+        vz2 = vz + az * dt
+
+        # update position (kinematic eqns)
+        px2 = px + vx * dt + 0.5 * ax * dt * dt
+        py2 = py + vy * dt + 0.5 * ay * dt * dt
+        pz2 = pz + vz * dt + 0.5 * az * dt * dt
+
+        s = np.array([px2, py2, pz2, vx2, vy2, vz2])
+        traj.append(s)
+
+    return np.array(traj), s
+
+# =============================
+# Distance Metric (robust to 3D pos or 6D state)
+# =============================
+
+def make_full_state(x):
+    """Convert a 3-element position or 6-element state into a full 6D state.
+
+    - If x has length 3 → [x,y,z, 0,0,0]
+    - If x has length 6 → returned as np.array
+    """
+    a = np.asarray(x)
+    if a.size == 3:
+        return np.array([a[0], a[1], a[2], 0.0, 0.0, 0.0], dtype=float)
+    if a.size == 6:
+        return a.astype(float)
+    raise ValueError("Input must be length 3 (position) or 6 (state)")
 
 
-# -------------------------------
-# Collision checking
-# -------------------------------
+def distance(s1, s2, alpha=1.0, beta=0.3):
+    """Distance metric between states or positions.
 
-@dataclass
-class CircleObstacle:
-    x: float
-    y: float
-    r: float
+    Accepts inputs that are length-3 (positions) or length-6 (state). Internally
+    compares position and velocity parts with weights.
+    """
+    a = make_full_state(s1)
+    b = make_full_state(s2)
+    dp = np.linalg.norm(a[:3] - b[:3])
+    dv = np.linalg.norm(a[3:] - b[3:])
+    return alpha * dp + beta * dv
 
-    def collides_point(self, px: float, py: float) -> bool:
-        return (px - self.x) ** 2 + (py - self.y) ** 2 <= self.r ** 2
+# =============================
+# Random Control Sampling
+# =============================
 
+def sample_random_control(a_max=4.0):
+    return np.random.uniform(-a_max, a_max, size=3)
 
-@dataclass
-class RectObstacle:
-    x: float
-    y: float
-    w: float
-    h: float
-
-    def collides_point(self, px: float, py: float) -> bool:
-        return (self.x <= px <= self.x + self.w) and (self.y <= py <= self.y + self.h)
-
-
-def collision_free_trajectory(traj: List[np.ndarray], circles: List[CircleObstacle], rects: List[RectObstacle]) -> bool:
-    for s in traj:
-        x, y = s[0], s[1]
-        for c in circles:
-            if c.collides_point(x, y):
-                return False
-        for r in rects:
-            if r.collides_point(x, y):
-                return False
-    return True
-
-
-# -------------------------------
-# Node and planner classes
-# -------------------------------
-
-@dataclass
+# =============================
+# RRT Node
+# =============================
 class Node:
-    state: np.ndarray  # shape (4,)
-    parent: Optional[int]  # index into planner.nodes
-    cost: float  # cost-to-come (use time for kinodynamic planning)
-    control: Optional[np.ndarray] = None
-    duration: Optional[float] = None
+    def __init__(self, state, parent=None, control=None):
+        self.state = np.array(state, dtype=float)
+        self.parent = parent
+        self.control = control
 
+# =============================
+# Find Nearest Node (robust)
+# =============================
+def nearest(nodes, sample):
+    """Return the nearest node object (by distance) to the sample.
 
-class IncrementalKD:
-    """Simple wrapper that caches points and lazily rebuilds a KDTree when needed."""
-    def __init__(self):
-        self.points: List[Tuple[float, float, float, float]] = []
-        self.tree: Optional[KDTree] = None
-        self.dirty = True
+    sample may be a 3D position or a full 6D state.
+    """
+    s_full = make_full_state(sample)
+    best = None
+    best_d = float('inf')
+    for n in nodes:
+        d = distance(n.state, s_full)
+        if d < best_d:
+            best = n
+            best_d = d
+    return best
 
-    def add(self, pt: Tuple[float, float, float, float]):
-        self.points.append(pt)
-        self.dirty = True
+# =============================
+# Reconstruct Final Path
+# =============================
 
-    def ensure(self):
-        if self.dirty:
-            if len(self.points) > 0:
-                self.tree = KDTree(self.points)
-            else:
-                self.tree = None
-            self.dirty = False
+def reconstruct_path(node):
+    path = []
+    while node is not None:
+        path.append(node.state)
+        node = node.parent
+    return np.array(path[::-1])
 
-    def query(self, pt: Tuple[float, float, float, float]):
-        self.ensure()
-        return self.tree.query(pt)
+# =============================
+# Main RRT Planning Loop
+# =============================
 
-    def query_k(self, pt: Tuple[float, float, float, float], k: int):
-        self.ensure()
-        return self.tree.query(pt, k=k)
+def rrt(start, goal, obstacles, bounds, max_iter=5000, goal_thresh=1.0):
+    """RRT planner in 3D kinodynamic state-space.
 
-    def query_radius(self, pt: Tuple[float, float, float, float], r: float):
-        self.ensure()
-        return self.tree.query_ball_point(pt, r)
+    start: length-6 state [x,y,z,vx,vy,vz]
+    goal: length-3 or length-6 (if full state) target
+    bounds: ([xmin,xmax],[ymin,ymax],[zmin,zmax]) or flat tuple
+    """
+    # normalize bounds to flat tuple (xmin,xmax,ymin,ymax,zmin,zmax)
+    if len(bounds) == 3 and all(len(b) == 2 for b in bounds):
+        (xmin, xmax), (ymin, ymax), (zmin, zmax) = bounds
+    else:
+        xmin, xmax, ymin, ymax, zmin, zmax = bounds
 
+    nodes = [Node(start)]
 
-class KinodynamicRRTStar:
-    def __init__(self,
-                 start: Tuple[float, float, float, float],
-                 goal_pos: Tuple[float, float],
-                 bounds: Tuple[float, float, float, float],
-                 circles: List[CircleObstacle] = None,
-                 rects: List[RectObstacle] = None,
-                 max_accel: float = 1.0,
-                 max_duration: float = 2.0,
-                 dt: float = 0.05,
-                 max_iter: int = 2000,
-                 goal_sample_rate: float = 0.1,
-                 neighbor_radius: float = 5.0):
-        """
-        start: full state (x,y,vx,vy)
-        goal_pos: only position target (x,y). Planner tries to reach goal position with any velocity.
-        bounds: (xmin, xmax, ymin, ymax)
-        max_accel: bound on |ax| and |ay|
-        max_duration: maximum duration for a single control rollout
-        dt: integration timestep
-        neighbor_radius: radius in state-space (Euclidean over x,y,vx,vy) for rewiring
-        """
-        self.start = Node(state=np.array(start, dtype=float), parent=None, cost=0.0)
-        self.goal_pos = np.array(goal_pos, dtype=float)
-        self.bounds = bounds
-        self.circles = circles or []
-        self.rects = rects or []
-        self.max_accel = max_accel
-        self.max_duration = max_duration
-        self.dt = dt
-        self.max_iter = max_iter
-        self.goal_sample_rate = goal_sample_rate
-        self.neighbor_radius = neighbor_radius
+    for it in range(max_iter):
+        # occasionally bias toward goal
+        if np.random.rand() < 0.15:
+            sample = goal
+        else:
+            sample = np.array([np.random.uniform(xmin, xmax),
+                               np.random.uniform(ymin, ymax),
+                               np.random.uniform(zmin, zmax)])
 
-        self.nodes: List[Node] = [self.start]
-        self.kdt = IncrementalKD()
-        self.kdt.add(tuple(self.start.state))
+        near = nearest(nodes, sample)
+        control = sample_random_control()
+        traj, new_state = propagate(near.state, control)
 
-        self.goal_node_idx: Optional[int] = None
+        if trajectory_collides(traj, obstacles):
+            continue
 
-    # sampling in state space (position+velocity)
-    def sample_state(self) -> np.ndarray:
-        if random.random() < self.goal_sample_rate and self.goal_node_idx is None:
-            # bias sampling toward goal position with small velocity
-            gx, gy = self.goal_pos
-            return np.array([gx + random.uniform(-0.5, 0.5),
-                             gy + random.uniform(-0.5, 0.5),
-                             random.uniform(-0.5, 0.5),
-                             random.uniform(-0.5, 0.5)])
-        xmin, xmax, ymin, ymax = self.bounds
-        return np.array([
-            random.uniform(xmin, xmax),
-            random.uniform(ymin, ymax),
-            random.uniform(-2.0, 2.0),  # velocity sampling bounds
-            random.uniform(-2.0, 2.0)
-        ])
+        new_node = Node(new_state, parent=near, control=control)
+        nodes.append(new_node)
 
-    def nearest_index(self, state: np.ndarray) -> int:
-        _, idx = self.kdt.query(tuple(state))
-        return int(idx)
+        # check goal proximity (compare positions)
+        if distance(new_state, goal) < goal_thresh:
+            print("Goal reached at iteration", it)
+            return reconstruct_path(new_node)
 
-    def near_indices(self, state: np.ndarray, k: int = 10) -> List[int]:
-        k = min(k, len(self.nodes))
-        _, idxs = self.kdt.query_k(tuple(state), k)
-        if isinstance(idxs, int):
-            idxs = [idxs]
-        return [int(i) for i in idxs]
+    print("Failed to find a path.")
+    return None
 
-    def radius_neighbors(self, state: np.ndarray, r: float) -> List[int]:
-        idxs = self.kdt.query_radius(tuple(state), r)
-        return [int(i) for i in idxs]
-
-    def plan(self):
-        for it in range(self.max_iter):
-            s_rand = self.sample_state()
-
-            nearest_idx = self.nearest_index(s_rand)
-            nearest_node = self.nodes[nearest_idx]
-
-            # sample a random control (bounded accelerations) and duration
-            ax = random.uniform(-self.max_accel, self.max_accel)
-            ay = random.uniform(-self.max_accel, self.max_accel)
-            dur = random.uniform(0.1, self.max_duration)
-
-            traj = propagate(nearest_node.state, np.array([ax, ay]), dur, self.dt)
-            final_state = traj[-1]
-
-            # ensure final position within bounds
-            xmin, xmax, ymin, ymax = self.bounds
-            if not (xmin <= final_state[0] <= xmax and ymin <= final_state[1] <= ymax):
-                continue
-
-            # collision check
-            if not collision_free_trajectory(traj, self.circles, self.rects):
-                continue
-
-            # cost is time
-            new_cost = nearest_node.cost + dur
-            new_node = Node(state=final_state.copy(), parent=nearest_idx, cost=new_cost,
-                            control=np.array([ax, ay]), duration=dur)
-
-            # find nearby nodes for potential better parent
-            neighbor_idxs = self.radius_neighbors(final_state, self.neighbor_radius)
-            best_parent_idx = nearest_idx
-            best_cost = new_cost
-            for ni in neighbor_idxs:
-                node = self.nodes[ni]
-                # try to connect from node -> new_state by simulating control needed
-                # for kinodynamic planning we can attempt a straight rollout from node to new_state
-                # but we'll instead check if rolling from that neighbor using sampled control reduces cost
-                # simplistic approach: check easier-to-compute cost via Euclidean distance/time heuristic
-                # For correctness, you'd sample controls per neighbor; here we accept cost heuristic
-                heuristic_time = node.cost + np.linalg.norm(node.state[:2] - final_state[:2]) / max(0.1, self.max_accel)
-                if heuristic_time < best_cost:
-                    # for safety, verify collision-free straight-line in position space between node and new_state
-                    # approximate using linear interpolation of positions
-                    if collision_free_trajectory([node.state, final_state], self.circles, self.rects):
-                        best_parent_idx = ni
-                        best_cost = heuristic_time
-
-            # attach to best parent
-            new_node.parent = best_parent_idx
-            new_node.cost = best_cost
-
-            # append node
-            new_idx = len(self.nodes)
-            self.nodes.append(new_node)
-            self.kdt.add(tuple(new_node.state))
-
-            # rewire neighbors: if going through new_node reduces their cost and a feasible control exists
-            for ni in neighbor_idxs:
-                neighbor = self.nodes[ni]
-                potential_cost = new_node.cost + np.linalg.norm(new_node.state[:2] - neighbor.state[:2]) / max(0.1, self.max_accel)
-                if potential_cost + 1e-6 < neighbor.cost:
-                    # attempt a fast collision check for straight-line pos connection
-                    if collision_free_trajectory([new_node.state, neighbor.state], self.circles, self.rects):
-                        neighbor.parent = new_idx
-                        neighbor.cost = potential_cost
-
-            # check if new node reaches goal region (position only)
-            if np.linalg.norm(new_node.state[:2] - self.goal_pos) < 1.0:  # goal radius
-                # attach a goal node (no dynamics needed) or mark goal
-                self.goal_node_idx = new_idx
-                # update c_best
-                self.kdt.dirty = True
-                break
-
-            # occasionally rebuild kdtree to keep queries fast
-            if it % 50 == 0:
-                self.kdt.ensure()
-
-        # final ensure
-        self.kdt.ensure()
-        return self.get_path()
-
-    def get_path(self) -> Optional[List[Tuple[float, float]]]:
-        if self.goal_node_idx is None:
-            return None
-        path = []
-        idx = self.goal_node_idx
-        while idx is not None:
-            node = self.nodes[idx]
-            path.append((float(node.state[0]), float(node.state[1])))
-            idx = node.parent
-        return path[::-1]
-
-
-# -------------------------------
-# Visualization
-# -------------------------------
-
-def plot_solution(rrt: KinodynamicRRTStar, path: Optional[List[Tuple[float, float]]]):
-    plt.figure(figsize=(8, 8))
-    # draw edges
-    for i, n in enumerate(rrt.nodes):
-        if n.parent is not None:
-            p1 = rrt.nodes[n.parent].state
-            p2 = n.state
-            plt.plot([p1[0], p2[0]], [p1[1], p2[1]], color='0.6', linewidth=0.7)
-
-    # obstacles
-    for c in rrt.circles:
-        plt.gca().add_patch(plt.Circle((c.x, c.y), c.r, color='gray'))
-    for r in rrt.rects:
-        plt.gca().add_patch(plt.Rectangle((r.x, r.y), r.w, r.h, color='gray'))
-
-    if path:
-        xs, ys = zip(*path)
-        plt.plot(xs, ys, '-r', linewidth=2, label='planned path')
-
-    plt.scatter(rrt.start.state[0], rrt.start.state[1], c='green', s=80, label='start')
-    plt.scatter(rrt.goal_pos[0], rrt.goal_pos[1], c='red', s=80, label='goal')
-    xmin, xmax, ymin, ymax = rrt.bounds
-    plt.xlim(xmin, xmax)
-    plt.ylim(ymin, ymax)
-    plt.gca().set_aspect('equal', adjustable='box')
-    plt.legend()
-    plt.show()
-
-
-# -------------------------------
-# Example usage
-# -------------------------------
-if __name__ == '__main__':
-    random.seed(0)
+# =============================
+# Example Usage
+# =============================
+if __name__ == "__main__":
     np.random.seed(0)
 
-    # Define obstacles
-    circles = [CircleObstacle(40, 40, 8), CircleObstacle(70, 70, 7)]
-    rects = [RectObstacle(60, 20, 12, 35)]
+    start = np.array([0, 0, 1, 0, 0, 0])  # x,y,z,vx,vy,vz
+    goal = np.array([10, 10, 2])  # position-only goal
 
-    # start state: x,y,vx,vy
-    start_state = (5.0, 5.0, 0.0, 0.0)
-    goal_pos = (95.0, 95.0)
-    bounds = (0.0, 100.0, 0.0, 100.0)
+    obstacles = [
+        AABB([3, 3, 0], [5, 5, 3]),
+        AABB([7, 7, 0], [8, 8, 5])
+    ]
 
-    rrt = KinodynamicRRTStar(start=start_state,
-                             goal_pos=goal_pos,
-                             bounds=bounds,
-                             circles=circles,
-                             rects=rects,
-                             max_accel=2.0,
-                             max_duration=1.0,
-                             dt=0.05,
-                             max_iter=4000,
-                             goal_sample_rate=0.15,
-                             neighbor_radius=6.0)
+    bounds = ((-5, 15), (-5, 15), (0, 6))
 
-    path = rrt.plan()
-    if path:
-        print(f'Found path with {len(path)} waypoints')
-    else:
-        print('No path found')
+    path = rrt(start, goal, obstacles, bounds)
 
-    plot_solution(rrt, path)
+    if path is not None:
+        print("Path (states):")
+        print(path)
