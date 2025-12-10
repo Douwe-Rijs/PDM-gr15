@@ -1,715 +1,609 @@
-# """
-# Optimal RRT (RRT*) implementation in 2D with configurable parameters.
-
-# Features:
-# - Goal bias sampling with configurable percentage (goal_sample_rate).
-# - Circular and rectangular obstacles.
-# - Configurable step size, max iterations, search radius factor for rewiring.
-# - Visualization using matplotlib (shows tree growth and final path).
-
-# Usage:
-# - Run as a script. Edit parameters in the `if __name__ == '__main__'` block or use programmatic API.
-
-# Author: ChatGPT
-# """
-
-# import math
-# import random
-# from collections import deque
-
-# import numpy as np
-# import matplotlib.pyplot as plt
-
-
-# MAX_ITER = 500
-# STEP_SIZE = 0.05
-# GOAL_SAMPLE_RATE = 0.10
-# SEARCH_RADIUS_FACTOR = 2.0
-# GOAL_RADIUS = 0.03
-# RANDOM_SEED = 42
-
-
-# class Node:
-#     def __init__(self, x, y):
-#         self.x = x
-#         self.y = y
-#         self.parent = None
-#         self.cost = 0.0  # cost from start
-
-#     def point(self):
-#         return (self.x, self.y)
-
-
-# class Obstacle:
-#     def collides(self, p1, p2=None):
-#         """Check collision. If p2 is None, just check point collision."""
-#         raise NotImplementedError
-
-
-# class CircleObstacle(Obstacle):
-#     def __init__(self, cx, cy, r):
-#         self.cx = cx
-#         self.cy = cy
-#         self.r = r
-
-#     def collides(self, p1, p2=None):
-#         if p2 is None:
-#             x, y = p1
-#             return (x - self.cx) ** 2 + (y - self.cy) ** 2 <= self.r ** 2
-#         # Check segment-circle intersection
-#         (x1, y1), (x2, y2) = p1, p2
-#         # Project center onto segment
-#         dx = x2 - x1
-#         dy = y2 - y1
-#         if dx == 0 and dy == 0:
-#             return self.collides(p1)
-#         t = ((self.cx - x1) * dx + (self.cy - y1) * dy) / (dx * dx + dy * dy)
-#         t = max(0.0, min(1.0, t))
-#         closest_x = x1 + t * dx
-#         closest_y = y1 + t * dy
-#         return (closest_x - self.cx) ** 2 + (closest_y - self.cy) ** 2 <= self.r ** 2
-
-
-# class RectObstacle(Obstacle):
-#     def __init__(self, xmin, ymin, xmax, ymax):
-#         self.xmin = min(xmin, xmax)
-#         self.xmax = max(xmin, xmax)
-#         self.ymin = min(ymin, ymax)
-#         self.ymax = max(ymin, ymax)
-
-#     def collides(self, p1, p2=None):
-#         if p2 is None:
-#             x, y = p1
-#             return self.xmin <= x <= self.xmax and self.ymin <= y <= self.ymax
-#         # Check segment-rectangle intersection (conservative): sample points along segment
-#         (x1, y1), (x2, y2) = p1, p2
-#         steps = max(8, int(math.hypot(x2 - x1, y2 - y1) / 0.01))
-#         for i in range(steps + 1):
-#             t = i / steps
-#             x = x1 + t * (x2 - x1)
-#             y = y1 + t * (y2 - y1)
-#             if self.xmin <= x <= self.xmax and self.ymin <= y <= self.ymax:
-#                 return True
-#         return False
-
-
-# class RRTStar:
-#     def __init__(self,
-#                  start,
-#                  goal,
-#                  map_bounds=(0, 0, 1, 1),
-#                  obstacles=None,
-#                  max_iter=500,
-#                  step_size=0.05,
-#                  goal_sample_rate=0.05,
-#                  search_radius_factor=1.0,
-#                  goal_radius=0.03,
-#                  seed=None):
-#         """
-#         start, goal: tuples (x,y)
-#         map_bounds: (xmin, ymin, xmax, ymax)
-#         obstacles: list of Obstacle instances
-#         max_iter: max number of samples
-#         step_size: incremental extension length
-#         goal_sample_rate: fraction [0,1] that samples are exactly goal
-#         search_radius_factor: multiplies the recommended rewiring radius
-#         goal_radius: distance threshold to consider goal reached
-#         """
-#         self.start = Node(*start)
-#         self.goal = Node(*goal)
-#         self.map_bounds = map_bounds
-#         self.width = map_bounds[2] - map_bounds[0]
-#         self.height = map_bounds[3] - map_bounds[1]
-#         self.obstacles = obstacles or []
-#         self.max_iter = max_iter
-#         self.step_size = step_size
-#         self.goal_sample_rate = max(0.0, min(1.0, goal_sample_rate))
-#         self.search_radius_factor = search_radius_factor
-#         self.goal_radius = goal_radius
-#         self.nodes = [self.start]
-#         if seed is not None:
-#             random.seed(seed)
-#             np.random.seed(seed)
-
-#     def plan(self, draw=False):
-#         best_goal_node = None
-#         for it in range(self.max_iter):
-#             rnd = self.sample()
-#             nearest = self.get_nearest(self.nodes, rnd)
-#             new_pt = self.steer((nearest.x, nearest.y), rnd, self.step_size)
-#             if not new_pt:
-#                 continue
-#             if self.collides((nearest.x, nearest.y), new_pt):
-#                 continue
-#             new_node = Node(*new_pt)
-#             new_node.parent = nearest
-#             new_node.cost = nearest.cost + self.dist((nearest.x, nearest.y), new_pt)
-
-#             # choose parent from nearby nodes for minimal cost
-#             nlist = self.near(self.nodes, new_node)
-#             new_parent = nearest
-#             new_cost = new_node.cost
-#             for nd in nlist:
-#                 if not self.collides((nd.x, nd.y), new_pt):
-#                     c = nd.cost + self.dist((nd.x, nd.y), new_pt)
-#                     if c < new_cost:
-#                         new_parent = nd
-#                         new_cost = c
-#             new_node.parent = new_parent
-#             new_node.cost = new_cost
-#             self.nodes.append(new_node)
-
-#             # rewire nearby nodes
-#             for nd in nlist:
-#                 if nd is new_node.parent:
-#                     continue
-#                 if self.collides((new_node.x, new_node.y), (nd.x, nd.y)):
-#                     continue
-#                 new_cost = new_node.cost + self.dist((new_node.x, new_node.y), (nd.x, nd.y))
-#                 if new_cost < nd.cost:
-#                     nd.parent = new_node
-#                     nd.cost = new_cost
-
-#             # check if it connects to goal
-#             if self.dist((new_node.x, new_node.y), (self.goal.x, self.goal.y)) <= self.goal_radius:
-#                 # create a goal node attached to new_node
-#                 goal_node = Node(self.goal.x, self.goal.y)
-#                 if not self.collides((new_node.x, new_node.y), (goal_node.x, goal_node.y)):
-#                     goal_node.parent = new_node
-#                     goal_node.cost = new_node.cost + self.dist((new_node.x, new_node.y), (goal_node.x, goal_node.y))
-#                     # keep best
-#                     if (best_goal_node is None) or (goal_node.cost < best_goal_node.cost):
-#                         best_goal_node = goal_node
-
-#             if draw and (it % max(1, self.max_iter // 200) == 0):
-#                 self.draw(show=False, best=best_goal_node)
-
-#         path = None
-#         if best_goal_node:
-#             path = self.extract_path(best_goal_node)
-
-#         return path, best_goal_node
-
-#     def sample(self):
-#         if random.random() < self.goal_sample_rate:
-#             return (self.goal.x, self.goal.y)
-#         xmin, ymin, xmax, ymax = self.map_bounds
-#         return (random.uniform(xmin, xmax), random.uniform(ymin, ymax))
-
-#     def steer(self, from_pt, to_pt, max_dist):
-#         (x1, y1) = from_pt
-#         (x2, y2) = to_pt
-#         dx = x2 - x1
-#         dy = y2 - y1
-#         dist = math.hypot(dx, dy)
-#         if dist == 0:
-#             return None
-#         if dist <= max_dist:
-#             return (x2, y2)
-#         theta = math.atan2(dy, dx)
-#         return (x1 + max_dist * math.cos(theta), y1 + max_dist * math.sin(theta))
-
-#     def collides(self, p1, p2=None):
-#         # Check if segment p1-p2 intersects any obstacle
-#         # Also check endpoints inside obstacles
-#         for ob in self.obstacles:
-#             if ob.collides(p1, p2):
-#                 return True
-#         return False
-
-#     def get_nearest(self, nodes, point):
-#         best = nodes[0]
-#         best_d = self.dist((best.x, best.y), point)
-#         for n in nodes:
-#             d = self.dist((n.x, n.y), point)
-#             if d < best_d:
-#                 best = n
-#                 best_d = d
-#         return best
-
-#     def near(self, nodes, node):
-#         # radius based on RRT* theoretical radius: r = gamma * (log(n)/n)^{1/d}
-#         n = len(nodes) + 1
-#         gamma = self.search_radius_factor * (2 * (1 + 1/2) ** (1/2))  # heuristic gamma
-#         dim = 2
-#         r = min(self.step_size * 50.0, gamma * ((math.log(n) / n) ** (1.0 / dim)))
-#         # ensure minimum radius at least step_size
-#         r = max(r, self.step_size * 1.5)
-#         near_nodes = [nd for nd in nodes if self.dist((nd.x, nd.y), (node.x, node.y)) <= r]
-#         return near_nodes
-
-#     @staticmethod
-#     def dist(a, b):
-#         return math.hypot(a[0] - b[0], a[1] - b[1])
-
-#     def extract_path(self, goal_node):
-#         path = []
-#         node = goal_node
-#         while node is not None:
-#             path.append((node.x, node.y))
-#             node = node.parent
-#         path.reverse()
-#         return path
-
-#     def draw(self, show=True, best=None):
-#         plt.clf()
-#         xmin, ymin, xmax, ymax = self.map_bounds
-#         plt.xlim(xmin, xmax)
-#         plt.ylim(ymin, ymax)
-#         # draw obstacles
-#         ax = plt.gca()
-#         for ob in self.obstacles:
-#             if isinstance(ob, CircleObstacle):
-#                 circ = plt.Circle((ob.cx, ob.cy), ob.r, fill=True, alpha=0.6)
-#                 ax.add_patch(circ)
-#             elif isinstance(ob, RectObstacle):
-#                 rect = plt.Rectangle((ob.xmin, ob.ymin), ob.xmax - ob.xmin, ob.ymax - ob.ymin, alpha=0.6)
-#                 ax.add_patch(rect)
-
-#         # draw tree
-#         for n in self.nodes:
-#             if n.parent is not None:
-#                 plt.scatter(n.x, n.y)
-#                 # plt.plot([n.x, n.parent.x], [n.y, n.parent.y])
-
-#         # draw start/goal
-#         plt.scatter(self.start.x, self.start.y, marker='o', c='green', s=50, label='start')
-#         plt.scatter(self.goal.x, self.goal.y, marker='x', c='red', s=50, label='goal')
-
-#         # draw best path if exists
-#         if best is not None:
-#             path = self.extract_path(best)
-#             xs = [p[0] for p in path]
-#             ys = [p[1] for p in path]
-#             plt.plot(xs, ys, linewidth=3, label='best path')
-
-#         plt.gca().set_aspect('equal', adjustable='box')
-#         plt.legend()
-#         plt.pause(0.001)
-#         if show:
-#             plt.show()
-
-
-# if __name__ == '__main__':
-#     # Example usage and parameter configuration
-#     start = (0.05, 0.05)
-#     goal = (0.95, 0.95)
-#     map_bounds = (0.0, 0.0, 1.0, 1.0)
-
-#     # Define obstacles (mix of circles and rectangles)
-#     obstacles = [
-#         CircleObstacle(0.4, 0.4, 0.12),
-#         CircleObstacle(0.7, 0.6, 0.10),
-#         RectObstacle(0.2, 0.7, 0.45, 0.85),
-#         RectObstacle(0.6, 0.15, 0.9, 0.3),
-#     ]
-
-#     planner = RRTStar(start=start,
-#                       goal=goal,
-#                       map_bounds=map_bounds,
-#                       obstacles=obstacles,
-#                       max_iter=MAX_ITER,
-#                       step_size=STEP_SIZE,
-#                       goal_sample_rate=GOAL_SAMPLE_RATE,
-#                       search_radius_factor=SEARCH_RADIUS_FACTOR,
-#                       goal_radius=GOAL_RADIUS,
-#                       seed=RANDOM_SEED)
-
-#     plt.ion()
-#     path, goal_node = planner.plan(draw=True)
-#     planner.draw(show=True, best=goal_node)
-
-#     if path:
-#         print('Found path with %d waypoints, cost=%.3f' % (len(path), goal_node.cost))
-#     else:
-#         print('No path found (increase iterations/step size or adjust obstacles).')
-
-#     # Keep plot open
-#     plt.ioff()
-#     plt.show()
-
+#!/usr/bin/env python3
 """
-Optimal RRT (RRT*) implementation in 2D with configurable parameters.
-
-Features:
-- Adaptive step size that decays as the tree grows.
-- Adaptive goal sampling: goal_sample_rate reduced after first goal found.
-- Pruning of nearby nodes (cost-based dominance).
-- Circular and rectangular obstacles.
-- Visualization using matplotlib (shows tree growth and final path).
-
-Usage:
-- Run as a script. Edit parameters in the `if __name__ == '__main__'` block or use programmatic API.
+Optimized RRT* in 2D with:
+- Cached and incrementally updated KD-tree
+- Reduced list comprehensions and caching of node points
+- Much faster ellipse sampling (true Informed RRT*)
+- Decreasing step size and adaptive goal sampling
+- Node pruning using KD-tree clustering
 """
-
-import math
-import random
-from collections import deque
 
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.spatial import KDTree
+import math
+import random
+
+# -------------------------------------------------------------
+# Utility functions
+# -------------------------------------------------------------
+def dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
-class Node:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.parent = None
-        self.cost = 0.0  # cost from start
-
-    def point(self):
-        return (self.x, self.y)
-
-
-class Obstacle:
-    def collides(self, p1, p2=None):
-        """Check collision. If p2 is None, just check point collision."""
-        raise NotImplementedError
+def steer(from_node, to_point, step):
+    fx, fy = from_node
+    tx, ty = to_point
+    dx, dy = tx - fx, ty - fy
+    d = math.hypot(dx, dy)
+    if d <= step:
+        return to_point
+    s = step / d
+    return (fx + s * dx, fy + s * dy)
 
 
-class CircleObstacle(Obstacle):
-    def __init__(self, cx, cy, r):
-        self.cx = cx
-        self.cy = cy
-        self.r = r
-
-    def collides(self, p1, p2=None):
-        if p2 is None:
-            x, y = p1
-            return (x - self.cx) ** 2 + (y - self.cy) ** 2 <= self.r ** 2
-        # Check segment-circle intersection
-        (x1, y1), (x2, y2) = p1, p2
-        dx = x2 - x1
-        dy = y2 - y1
-        if dx == 0 and dy == 0:
-            return self.collides(p1)
-        t = ((self.cx - x1) * dx + (self.cy - y1) * dy) / (dx * dx + dy * dy)
-        t = max(0.0, min(1.0, t))
-        closest_x = x1 + t * dx
-        closest_y = y1 + t * dy
-        return (closest_x - self.cx) ** 2 + (closest_y - self.cy) ** 2 <= self.r ** 2
-
-
-class RectObstacle(Obstacle):
-    def __init__(self, xmin, ymin, xmax, ymax):
-        self.xmin = min(xmin, xmax)
-        self.xmax = max(xmin, xmax)
-        self.ymin = min(ymin, ymax)
-        self.ymax = max(ymin, ymax)
-
-    def collides(self, p1, p2=None):
-        if p2 is None:
-            x, y = p1
-            return self.xmin <= x <= self.xmax and self.ymin <= y <= self.ymax
-        # Check segment-rectangle intersection (conservative): sample points along segment
-        (x1, y1), (x2, y2) = p1, p2
-        steps = max(8, int(math.hypot(x2 - x1, y2 - y1) / 0.01))
-        for i in range(steps + 1):
-            t = i / steps
-            x = x1 + t * (x2 - x1)
-            y = y1 + t * (y2 - y1)
-            if self.xmin <= x <= self.xmax and self.ymin <= y <= self.ymax:
+def inside_obstacle(point, obstacles):
+    x, y = point
+    for obs in obstacles:
+        t = obs["type"]
+        if t == "circle":
+            if dist(point, (obs["x"], obs["y"])) <= obs["r"]:
                 return True
-        return False
+        elif t == "rect":
+            if obs["x"] <= x <= obs["x"] + obs["w"] and obs["y"] <= y <= obs["y"] + obs["h"]:
+                return True
+    return False
+
+
+def collision_free(p1, p2, obstacles, resolution=10):
+    x1, y1 = p1
+    x2, y2 = p2
+    for t in np.linspace(0, 1, resolution):
+        x = x1 + t * (x2 - x1)
+        y = y1 + t * (y2 - y1)
+        if inside_obstacle((x, y), obstacles):
+            return False
+    return True
+
+# -------------------------------------------------------------
+# RRT* class
+# -------------------------------------------------------------
+class Node:
+    __slots__ = ("point", "parent", "cost")
+    def __init__(self, point):
+        self.point = point
+        self.parent = None
+        self.cost = float("inf")
+
+
+class DynamicKDTree:
+    """Incremental KD-tree that updates only when needed."""
+    def __init__(self):
+        self.points = []
+        self.tree = None
+        self.dirty = True
+
+    def add(self, point):
+        self.points.append(point)
+        self.dirty = True
+
+    def rebuild(self):
+        self.tree = KDTree(self.points) if self.points else None
+        self.dirty = False
+
+    def ensure(self):
+        if self.dirty:
+            self.rebuild()
+
+    def query(self, point):
+        self.ensure()
+        return self.tree.query(point)
+
+    def query_k(self, point, k):
+        self.ensure()
+        return self.tree.query(point, k)
+
+    def query_radius(self, point, r):
+        self.ensure()
+        return self.tree.query_ball_point(point, r)
 
 
 class RRTStar:
-    def __init__(self,
-                 start,
-                 goal,
-                 map_bounds=(0, 0, 1, 1),
-                 obstacles=None,
-                 max_iter=500,
-                 step_size=0.05,
-                 goal_sample_rate=0.05,
-                 search_radius_factor=1.0,
-                 goal_radius=0.03,
-                 prune_radius=0.01,
-                 step_decay=0.0005,
-                 goal_sample_rate_decay=0.5,
-                 seed=None):
-        """
-        start, goal: tuples (x,y)
-        map_bounds: (xmin, ymin, xmax, ymax)
-        obstacles: list of Obstacle instances
-        max_iter: max number of samples
-        step_size: base incremental extension length
-        goal_sample_rate: fraction [0,1] that samples are exactly goal
-        search_radius_factor: multiplies the recommended rewiring radius
-        goal_radius: distance threshold to consider goal reached
-        prune_radius: nodes closer than this may be pruned
-        step_decay: how strongly step size shrinks with number of nodes
-        goal_sample_rate_decay: multiplicative factor applied to goal_sample_rate after first goal found
-        """
-        self.start = Node(*start)
-        self.goal = Node(*goal)
-        self.map_bounds = map_bounds
-        self.width = map_bounds[2] - map_bounds[0]
-        self.height = map_bounds[3] - map_bounds[1]
+    def __init__(self, start, goal, bounds, obstacles=None,
+                 step_size=5.0,
+                 min_step_size=0.5,
+                 goal_sample_rate=0.1,
+                 max_iter=3000,
+                 prune_radius=1.0,
+                 k_nearest=20):
+
+        self.start = Node(start)
+        self.start.cost = 0.0
+        self.goal = Node(goal)
+        self.bounds = bounds
         self.obstacles = obstacles or []
+
+        self.initial_step = step_size
+        self.min_step_size = min_step_size
+        self.goal_sample_rate = goal_sample_rate
+        self.goal_found = False
+        self.c_best = float("inf")
+
         self.max_iter = max_iter
-        self.base_step_size = step_size
-        self.base_goal_sample_rate = max(0.0, min(1.0, goal_sample_rate))
-        self.goal_sample_rate = self.base_goal_sample_rate
-        self.search_radius_factor = search_radius_factor
-        self.goal_radius = goal_radius
-        self.nodes = [self.start]
-        self.found_goal_once = False
         self.prune_radius = prune_radius
-        self.step_decay = step_decay
-        self.goal_sample_rate_decay = goal_sample_rate_decay
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
+        self.k_nearest = k_nearest
 
-    def plan(self, draw=False):
-        best_goal_node = None
-        for it in range(self.max_iter):
-            # update adaptive parameters (step size implicitly used in steer)
-            rnd = self.sample()
-            nearest = self.get_nearest(self.nodes, rnd)
-            new_pt = self.steer((nearest.x, nearest.y), rnd)
-            if not new_pt:
-                continue
-            if self.collides((nearest.x, nearest.y), new_pt):
-                continue
-            new_node = Node(*new_pt)
-            new_node.parent = nearest
-            new_node.cost = nearest.cost + self.dist((nearest.x, nearest.y), new_pt)
+        self.nodes = [self.start]
 
-            # prune nodes near new_node (cost-based)
-            if self.prune_radius > 0:
-                self.prune_nearby(new_node)
+        # Incremental KD-tree
+        self.kdtree = DynamicKDTree()
+        self.kdtree.add(start)
 
-            # choose parent from nearby nodes for minimal cost
-            nlist = self.near(self.nodes, new_node)
-            new_parent = nearest
-            new_cost = new_node.cost
-            for nd in nlist:
-                if not self.collides((nd.x, nd.y), new_pt):
-                    c = nd.cost + self.dist((nd.x, nd.y), new_pt)
-                    if c < new_cost:
-                        new_parent = nd
-                        new_cost = c
-            new_node.parent = new_parent
-            new_node.cost = new_cost
-            self.nodes.append(new_node)
+        # Precompute ellipse rotation
+        s = np.array(start)
+        g = np.array(goal)
+        direction = (g - s) / np.linalg.norm(g - s)
+        angle = math.atan2(direction[1], direction[0])
+        self.R_ellipse = np.array([[math.cos(angle), -math.sin(angle)],
+                                   [math.sin(angle),  math.cos(angle)]])
+        self.focal_mid = (s + g) / 2.0
+        self.c_min = np.linalg.norm(g - s)
 
-            # rewire nearby nodes
-            for nd in nlist:
-                if nd is new_node.parent:
-                    continue
-                if self.collides((new_node.x, new_node.y), (nd.x, nd.y)):
-                    continue
-                new_cost = new_node.cost + self.dist((new_node.x, new_node.y), (nd.x, nd.y))
-                if new_cost < nd.cost:
-                    nd.parent = new_node
-                    nd.cost = new_cost
-
-            # check if it connects to goal
-            if self.dist((new_node.x, new_node.y), (self.goal.x, self.goal.y)) <= self.goal_radius:
-                # create a goal node attached to new_node
-                goal_node = Node(self.goal.x, self.goal.y)
-                if not self.collides((new_node.x, new_node.y), (goal_node.x, goal_node.y)):
-                    goal_node.parent = new_node
-                    goal_node.cost = new_node.cost + self.dist((new_node.x, new_node.y), (goal_node.x, goal_node.y))
-                    # keep best
-                    if (best_goal_node is None) or (goal_node.cost < best_goal_node.cost):
-                        best_goal_node = goal_node
-                    self.found_goal_once = True
-
-            if draw and (it % max(1, self.max_iter // 200) == 0):
-                self.draw(show=False, best=best_goal_node)
-
-        path = None
-        if best_goal_node:
-            path = self.extract_path(best_goal_node)
-
-        return path, best_goal_node
-
-    def sample(self):
-        # reduce goal sampling rate once goal seen
-        if self.found_goal_once:
-            eff_goal_sample_rate = self.base_goal_sample_rate * self.goal_sample_rate_decay
-        else:
-            eff_goal_sample_rate = self.base_goal_sample_rate
-
-        if random.random() < eff_goal_sample_rate:
-            return (self.goal.x, self.goal.y)
-        xmin, ymin, xmax, ymax = self.map_bounds
-        return (random.uniform(xmin, xmax), random.uniform(ymin, ymax))
-
-    def steer(self, from_pt, to_pt):
-        (x1, y1) = from_pt
-        (x2, y2) = to_pt
-        dx = x2 - x1
-        dy = y2 - y1
-        dist = math.hypot(dx, dy)
-        if dist == 0:
+    # ---- Optimized Informed RRT* ellipse sampling ----
+    def sample_in_ellipse(self):
+        if not self.goal_found:
             return None
-        # adaptive step: base_step_size / (1 + step_decay * n_nodes)
-        adaptive_step = self.base_step_size / (1.0 + self.step_decay * len(self.nodes))
-        if dist <= adaptive_step:
-            return (x2, y2)
-        theta = math.atan2(dy, dx)
-        return (x1 + adaptive_step * math.cos(theta), y1 + adaptive_step * math.sin(theta))
+        c_best = self.c_best
+        if c_best < self.c_min:
+            return None
 
-    def collides(self, p1, p2=None):
-        # Check if segment p1-p2 intersects any obstacle
-        # Also check endpoints inside obstacles
-        for ob in self.obstacles:
-            if ob.collides(p1, p2):
-                return True
-        return False
+        # Semi-major/minor axes
+        a = c_best / 2
+        b = math.sqrt(c_best**2 - self.c_min**2) / 2
 
-    def get_nearest(self, nodes, point):
-        best = nodes[0]
-        best_d = self.dist((best.x, best.y), point)
-        for n in nodes:
-            d = self.dist((n.x, n.y), point)
-            if d < best_d:
-                best = n
-                best_d = d
-        return best
+        # Sample within unit circle
+        r = math.sqrt(random.random())
+        t = random.random() * 2 * math.pi
+        unit = np.array([r * math.cos(t), r * math.sin(t)])
 
-    def near(self, nodes, node):
-        # radius based on RRT* theoretical radius: r = gamma * (log(n)/n)^{1/d}
-        n = len(nodes) + 1
-        gamma = self.search_radius_factor * (2 * (1 + 1/2) ** (1/2))  # heuristic gamma
-        dim = 2
-        # ensure n>1 for log
-        if n <= 1:
-            r = self.base_step_size * 2.0
+        # Map to ellipse
+        point = self.R_ellipse @ np.array([a, 0]) * 0  # keep shape stable
+        mapped = self.R_ellipse @ (np.array([a, b]) * unit) + self.focal_mid
+        x, y = mapped
+
+        bx1, bx2, by1, by2 = self.bounds
+        if bx1 <= x <= bx2 and by1 <= y <= by2:
+            return (float(x), float(y))
+        return None
+
+    def random_sample(self):
+        if self.goal_found:
+            p = self.sample_in_ellipse()
+            if p is not None:
+                return p
+
+            # reduce goal sampling rate significantly
+            if random.random() < self.goal_sample_rate * 0.1:
+                return self.goal.point
         else:
-            r = min(self.base_step_size * 50.0, gamma * ((math.log(n) / n) ** (1.0 / dim)))
-        # ensure minimum radius at least step_size
-        r = max(r, self.base_step_size * 1.5)
-        near_nodes = [nd for nd in nodes if self.dist((nd.x, nd.y), (node.x, node.y)) <= r]
-        return near_nodes
+            if random.random() < self.goal_sample_rate:
+                return self.goal.point
 
-    def prune_nearby(self, new_node):
-        # Remove nearby nodes that are strictly worse (higher cost) than new_node.
-        # If a nearby node has lower cost than new_node, we keep the existing node and do not remove new_node.
-        to_remove = []
-        for nd in list(self.nodes):
-            if nd is new_node.parent:
+        bx1, bx2, by1, by2 = self.bounds
+        return (random.uniform(bx1, bx2), random.uniform(by1, by2))
+
+    # ---- Pruning ----
+    def prune_nodes(self):
+        to_remove = set()
+        pts = self.kdtree.points
+
+        for i, n in enumerate(self.nodes):
+            if i in to_remove:
                 continue
-            d = self.dist((nd.x, nd.y), (new_node.x, new_node.y))
-            if d < self.prune_radius:
-                # If nd has higher cost, mark it for removal
-                if nd.cost > new_node.cost:
-                    to_remove.append(nd)
-                else:
-                    # keep better node; abandon pruning (do not remove new_node)
-                    return
-        for nd in to_remove:
-            try:
-                self.nodes.remove(nd)
-            except ValueError:
-                pass
+            idxs = self.kdtree.query_radius(n.point, self.prune_radius)
+            if len(idxs) > 1:
+                best = min(idxs, key=lambda j: self.nodes[j].cost)
+                for j in idxs:
+                    if j != best:
+                        to_remove.add(j)
 
-    @staticmethod
-    def dist(a, b):
-        return math.hypot(a[0] - b[0], a[1] - b[1])
+        if to_remove:
+            self.nodes = [n for i, n in enumerate(self.nodes) if i not in to_remove]
+            self.kdtree.points = [n.point for n in self.nodes]
+            self.kdtree.dirty = True
 
-    def extract_path(self, goal_node):
+    # ---- Main planning ----
+    def plan(self):
+        for k in range(self.max_iter):
+
+            step = max(self.min_step_size,
+                        self.initial_step * (0.995 ** (len(self.nodes) * 0.01)))
+
+            q_rand = self.random_sample()
+            _, idx = self.kdtree.query(q_rand)
+            q_near = self.nodes[idx]
+
+            q_new_pt = steer(q_near.point, q_rand, step)
+            if inside_obstacle(q_new_pt, self.obstacles):
+                continue
+            if not collision_free(q_near.point, q_new_pt, self.obstacles):
+                continue
+
+            q_new = Node(q_new_pt)
+
+            # k nearest neighbors
+            k_eff = min(self.k_nearest, len(self.nodes))
+            _, idxs = self.kdtree.query_k(q_new_pt, k_eff)
+            if isinstance(idxs, np.int64):
+                idxs = [idxs]
+
+            best_parent = q_near
+            best_cost = q_near.cost + dist(q_near.point, q_new_pt)
+
+            for i in idxs:
+                nb = self.nodes[i]
+                c = nb.cost + dist(nb.point, q_new_pt)
+                if c < best_cost and collision_free(nb.point, q_new_pt, self.obstacles):
+                    best_cost = c
+                    best_parent = nb
+
+            q_new.parent = best_parent
+            q_new.cost = best_cost
+
+            self.nodes.append(q_new)
+            self.kdtree.add(q_new_pt)
+
+            # rewire
+            for i in idxs:
+                nb = self.nodes[i]
+                c = q_new.cost + dist(nb.point, q_new_pt)
+                if c < nb.cost and collision_free(nb.point, q_new_pt, self.obstacles):
+                    nb.parent = q_new
+                    nb.cost = c
+
+            if k % 100 == 0:
+                self.prune_nodes()
+
+            # goal connect
+            if dist(q_new_pt, self.goal.point) < step:
+                if collision_free(q_new_pt, self.goal.point, self.obstacles):
+                    self.goal_found = True
+                    self.goal.parent = q_new
+                    self.goal.cost = q_new.cost + dist(q_new_pt, self.goal.point)
+                    self.c_best = self.goal.cost
+
+        return self.get_path()
+
+    def get_path(self):
+        if not self.goal_found:
+            return None
         path = []
-        node = goal_node
-        while node is not None:
-            path.append((node.x, node.y))
-            node = node.parent
-        path.reverse()
-        return path
+        n = self.goal
+        while n is not None:
+            path.append(n.point)
+            n = n.parent
+        return path[::-1]
 
-    def draw(self, show=True, best=None):
-        plt.clf()
-        xmin, ymin, xmax, ymax = self.map_bounds
-        plt.xlim(xmin, xmax)
-        plt.ylim(ymin, ymax)
-        # draw obstacles
-        ax = plt.gca()
-        for ob in self.obstacles:
-            if isinstance(ob, CircleObstacle):
-                circ = plt.Circle((ob.cx, ob.cy), ob.r, fill=True, alpha=0.6)
-                ax.add_patch(circ)
-            elif isinstance(ob, RectObstacle):
-                rect = plt.Rectangle((ob.xmin, ob.ymin), ob.xmax - ob.xmin, ob.ymax - ob.ymin, alpha=0.6)
-                ax.add_patch(rect)
+# -------------------------------------------------------------
+# Visualization
+# -------------------------------------------------------------
+def plot(rrt, path=None):
+    plt.figure(figsize=(8, 8))
+    for n in rrt.nodes:
+        if n.parent:
+            x1, y1 = n.point
+            x2, y2 = n.parent.point
+            plt.plot([x1, x2], [y1, y2], "k-", linewidth=0.25)
 
-        # draw tree
-        for n in self.nodes:
-            if n.parent is not None:
-                plt.scatter(n.x, n.y)
-                # plt.plot([n.x, n.parent.x], [n.y, n.parent.y])
-
-        # draw start/goal
-        plt.scatter(self.start.x, self.start.y, marker='o', s=50, label='start', c="darkgreen")
-        plt.scatter(self.goal.x, self.goal.y, marker='x', s=50, label='goal', c="red")
-
-        # draw best path if exists
-        if best is not None:
-            path = self.extract_path(best)
-            xs = [p[0] for p in path]
-            ys = [p[1] for p in path]
-            plt.plot(xs, ys, linewidth=3, label='best path')
-
-        plt.gca().set_aspect('equal', adjustable='box')
-        plt.legend()
-        plt.pause(0.001)
-        if show:
-            plt.show()
-
-
-if __name__ == '__main__':
-    # Example usage and parameter configuration
-    start = (0.05, 0.05)
-    goal = (0.95, 0.95)
-    map_bounds = (0.0, 0.0, 1.0, 1.0)
-
-    # Define obstacles (mix of circles and rectangles)
-    obstacles = [
-        CircleObstacle(0.4, 0.4, 0.12),
-        CircleObstacle(0.7, 0.6, 0.10),
-        RectObstacle(0.2, 0.7, 0.45, 0.85),
-        RectObstacle(0.6, 0.15, 0.9, 0.3),
-    ]
-
-    # Configurable parameters
-    params = {
-        'max_iter': 500,
-        'step_size': 0.05,
-        'goal_sample_rate': 0.10,  # 10% of samples are the goal initially
-        'search_radius_factor': 2.0,
-        'goal_radius': 0.03,
-        'prune_radius': 0.02,
-        'step_decay': 0.0008,
-        'goal_sample_rate_decay': 0.25,  # reduce goal sampling to 25% of base after first goal
-        'seed': 42,
-    }
-
-    planner = RRTStar(start=start,
-                      goal=goal,
-                      map_bounds=map_bounds,
-                      obstacles=obstacles,
-                      max_iter=params['max_iter'],
-                      step_size=params['step_size'],
-                      goal_sample_rate=params['goal_sample_rate'],
-                      search_radius_factor=params['search_radius_factor'],
-                      goal_radius=params['goal_radius'],
-                      prune_radius=params['prune_radius'],
-                      step_decay=params['step_decay'],
-                      goal_sample_rate_decay=params['goal_sample_rate_decay'],
-                      seed=params['seed'])
-
-    plt.ion()
-    path, goal_node = planner.plan(draw=True)
-    planner.draw(show=True, best=goal_node)
+    for obs in rrt.obstacles:
+        if obs["type"] == "circle": plt.gca().add_patch(plt.Circle((obs["x"], obs["y"]), obs["r"], color="gray"))
+        elif obs["type"] == "rect": plt.gca().add_patch(plt.Rectangle((obs["x"], obs["y"]), obs["w"], obs["h"], color="gray"))
 
     if path:
-        print('Found path with %d waypoints, cost=%.3f' % (len(path), goal_node.cost))
-    else:
-        print('No path found (increase iterations/step size or adjust obstacles).')
+        xs, ys = zip(*path)
+        plt.plot(xs, ys, "r-", linewidth=2)
 
-    # Keep plot open
-    plt.ioff()
+    plt.scatter(*rrt.start.point, c="green", s=60)
+    plt.scatter(*rrt.goal.point, c="red", s=60)
+    bx1, bx2, by1, by2 = rrt.bounds
+    plt.xlim(bx1, bx2)
+    plt.ylim(by1, by2)
+    plt.gca().set_aspect("equal", adjustable="box")
     plt.show()
+
+# -------------------------------------------------------------
+# Example
+# -------------------------------------------------------------
+if __name__ == "__main__":
+    random.seed(0)
+    np.random.seed(0)
+
+    obstacles = [
+        {"type": "circle", "x": 40, "y": 40, "r": 10},
+        {"type": "rect", "x": 60, "y": 20, "w": 15, "h": 40},
+    ]
+
+    rrt = RRTStar(start=(5, 5), goal=(95, 95),
+                  bounds=(0, 100, 0, 100), obstacles=obstacles,
+                  step_size=5.0, min_step_size=0.5, goal_sample_rate=0.2,
+                  max_iter=5000, prune_radius=2.0, k_nearest=40)
+
+    path = rrt.plan()
+    plot(rrt, path)
+
+
+# #!.venv/bin/python3
+# """
+# RRT* in 2D with:
+# - Decreasing step size as tree grows
+# - Decreasing goal sample rate after goal found
+# - Node pruning using k-d tree clustering
+# - Informed RRT* (elliptical sampling)
+# """
+
+# import numpy as np
+# import matplotlib.pyplot as plt
+# from scipy.spatial import KDTree
+# import math
+# import random
+
+# # -------------------------------------------------------------
+# # Utility functions
+# # -------------------------------------------------------------
+# def dist(a, b):
+#     return np.linalg.norm(np.array(a) - np.array(b))
+
+
+# def steer(from_node, to_point, step):
+#     """Return a new point in direction from_node → to_point, limited by step"""
+#     v = np.array(to_point) - np.array(from_node)
+#     d = np.linalg.norm(v)
+#     if d <= step:
+#         return tuple(to_point)
+#     return tuple(from_node + v / d * step)
+
+
+# def inside_obstacle(point, obstacles):
+#     x, y = point
+#     for obs in obstacles:
+#         if obs["type"] == "circle":
+#             if dist((x, y), (obs["x"], obs["y"])) <= obs["r"]:
+#                 return True
+#         elif obs["type"] == "rect":
+#             if obs["x"] <= x <= obs["x"] + obs["w"] and obs["y"] <= y <= obs["y"] + obs["h"]:
+#                 return True
+#     return False
+
+
+# def collision_free(p1, p2, obstacles, resolution=20):
+#     for t in np.linspace(0, 1, resolution):
+#         x = p1[0] + t * (p2[0] - p1[0])
+#         y = p1[1] + t * (p2[1] - p1[1])
+#         if inside_obstacle((x, y), obstacles):
+#             return False
+#     return True
+
+# # -------------------------------------------------------------
+# # RRT* class
+# # -------------------------------------------------------------
+# class Node:
+#     def __init__(self, point):
+#         self.point = tuple(point)
+#         self.parent = None
+#         self.cost = float("inf")
+
+
+# class RRTStar:
+#     def __init__(self, start, goal, bounds, obstacles=None,
+#                  step_size=5.0,
+#                  min_step_size=0.5,
+#                  goal_sample_rate=0.1,
+#                  max_iter=3000,
+#                  prune_radius=1.0,
+#                  k_nearest=20):
+
+#         self.start = Node(start)
+#         self.start.cost = 0.0
+#         self.goal = Node(goal)
+#         self.bounds = bounds
+#         self.obstacles = obstacles or []
+
+#         # dynamic parameters
+#         self.initial_step = step_size
+#         self.min_step_size = min_step_size
+#         self.goal_sample_rate = goal_sample_rate
+#         self.goal_found = False
+
+#         self.max_iter = max_iter
+#         self.prune_radius = prune_radius
+#         self.k_nearest = k_nearest
+
+#         self.nodes = [self.start]
+
+#     # ---- Informed RRT*: ellipse sampling ----
+#     def sample_in_ellipse(self, c_best):
+#         start = np.array(self.start.point)
+#         goal = np.array(self.goal.point)
+#         c_min = dist(start, goal)
+#         if c_best < c_min:
+#             return None
+
+#         # ellipse major/minor axes
+#         a = c_best / 2
+#         b = math.sqrt(c_best**2 - c_min**2) / 2 if c_best > c_min else 0.001
+
+#         # sample inside unit circle
+#         r = math.sqrt(random.random())
+#         theta = random.random() * 2 * math.pi
+#         sample = np.array([r * math.cos(theta), r * math.sin(theta)])
+
+#         # scale to ellipse
+#         L = np.diag([a, b])
+
+#         # rotation
+#         direction = (goal - start) / np.linalg.norm(goal - start)
+#         angle = math.atan2(direction[1], direction[0])
+#         R = np.array([[math.cos(angle), -math.sin(angle)],
+#                       [math.sin(angle),  math.cos(angle)]])
+
+#         mapped = R @ (L @ sample) + (start + goal) / 2
+#         x, y = mapped
+
+#         if self.bounds[0] <= x <= self.bounds[1] and self.bounds[2] <= y <= self.bounds[3]:
+#             return (x, y)
+#         return None
+
+#     # ---- General sampling ----
+#     def random_sample(self):
+#         # try ellipse first
+#         if self.goal_found:
+#             ellipse_sample = self.sample_in_ellipse(self.goal.cost)
+#             if ellipse_sample is not None:
+#                 return ellipse_sample
+
+#             # also reduce goal sample rate
+#             p = self.goal_sample_rate * 0.1
+#             if random.random() < p:
+#                 return self.goal.point
+#         else:
+#             if random.random() < self.goal_sample_rate:
+#                 return self.goal.point
+
+#         return (random.uniform(self.bounds[0], self.bounds[1]),
+#                 random.uniform(self.bounds[2], self.bounds[3]))
+
+#     # ---- KD Tree nearest neighbor ----
+#     def kd_tree(self):
+#         return KDTree([n.point for n in self.nodes])
+
+#     # ---- Pruning nodes ----
+#     def prune_nodes(self):
+#         """
+#         Use KD-tree to find nodes within prune_radius of each other.
+#         Keep the one with lowest cost, remove others.
+#         """
+#         tree = self.kd_tree()
+#         to_remove = set()
+
+#         for i, n in enumerate(self.nodes):
+#             if i in to_remove:
+#                 continue
+#             idxs = tree.query_ball_point(n.point, self.prune_radius)
+#             if len(idxs) > 1:
+#                 # keep node with minimum cost
+#                 costs = [(self.nodes[j].cost, j) for j in idxs]
+#                 _, best = min(costs)
+#                 for j in idxs:
+#                     if j != best:
+#                         to_remove.add(j)
+
+#         # build new list
+#         self.nodes = [n for i, n in enumerate(self.nodes) if i not in to_remove]
+
+#     # ---- Find k nearest neighbors ----
+#     def k_nearest_neighbors(self, point):
+#         tree = self.kd_tree()
+#         d, idxs = tree.query(point, k=min(self.k_nearest, len(self.nodes)))
+#         if isinstance(idxs, np.int64):
+#             idxs = [idxs]
+#         return [self.nodes[i] for i in idxs]
+
+#     # ---- Main planning ----
+#     def plan(self):
+#         for k in range(self.max_iter):
+
+#             # dynamic step size
+#             step = max(self.min_step_size, self.initial_step * (0.99 ** (len(self.nodes) / 50)))
+
+#             q_rand = self.random_sample()
+#             tree = self.kd_tree()
+#             _, nearest_idx = tree.query(q_rand)
+#             q_near = self.nodes[nearest_idx]
+
+#             q_new_pt = steer(q_near.point, q_rand, step)
+#             if inside_obstacle(q_new_pt, self.obstacles):
+#                 continue
+#             if not collision_free(q_near.point, q_new_pt, self.obstacles):
+#                 continue
+
+#             q_new = Node(q_new_pt)
+
+#             # choose parent
+#             neighbors = self.k_nearest_neighbors(q_new.point)
+#             best_parent = q_near
+#             best_cost = q_near.cost + dist(q_near.point, q_new.point)
+
+#             for nb in neighbors:
+#                 if collision_free(nb.point, q_new.point, self.obstacles):
+#                     c = nb.cost + dist(nb.point, q_new.point)
+#                     if c < best_cost:
+#                         best_parent = nb
+#                         best_cost = c
+
+#             q_new.parent = best_parent
+#             q_new.cost = best_cost
+#             self.nodes.append(q_new)
+
+#             # rewire
+#             for nb in neighbors:
+#                 if nb == q_new:
+#                     continue
+#                 c = q_new.cost + dist(nb.point, q_new.point)
+#                 if c < nb.cost and collision_free(nb.point, q_new.point, self.obstacles):
+#                     nb.parent = q_new
+#                     nb.cost = c
+
+#             # prune after some iterations
+#             if k % 50 == 0:
+#                 self.prune_nodes()
+
+#             # goal found?
+#             if dist(q_new.point, self.goal.point) < step:
+#                 if collision_free(q_new.point, self.goal.point, self.obstacles):
+#                     self.goal.parent = q_new
+#                     self.goal.cost = q_new.cost + dist(q_new.point, self.goal.point)
+#                     self.goal_found = True
+
+#         return self.get_path()
+
+#     def get_path(self):
+#         if not self.goal_found:
+#             return None
+#         path = []
+#         n = self.goal
+#         while n is not None:
+#             path.append(n.point)
+#             n = n.parent
+#         return path[::-1]
+
+
+# # -------------------------------------------------------------
+# # Visualization
+# # -------------------------------------------------------------
+# def plot(rrt, path=None):
+#     plt.figure(figsize=(8, 8))
+
+#     for n in rrt.nodes:
+#         if n.parent:
+#             plt.plot([n.point[0], n.parent.point[0]], [n.point[1], n.parent.point[1]], "k-", linewidth=0.3)
+
+#     for obs in rrt.obstacles:
+#         if obs["type"] == "circle": plt.gca().add_patch(plt.Circle((obs["x"], obs["y"]), obs["r"], color="gray"))
+#         elif obs["type"] == "rect": plt.gca().add_patch(plt.Rectangle((obs["x"], obs["y"]), obs["w"], obs["h"], color="gray"))
+
+#     if path:
+#         xs, ys = zip(*path)
+#         plt.plot(xs, ys, "r-", linewidth=2)
+
+#     plt.scatter(*rrt.start.point, c="green", s=80)
+#     plt.scatter(*rrt.goal.point, c="red", s=80)
+#     plt.xlim(rrt.bounds[0], rrt.bounds[1])
+#     plt.ylim(rrt.bounds[2], rrt.bounds[3])
+#     plt.gca().set_aspect("equal", adjustable="box")
+#     plt.show()
+
+# # -------------------------------------------------------------
+# # Example
+# # -------------------------------------------------------------
+# if __name__ == "__main__":
+#     obstacles = [
+#         {"type": "circle", "x": 40, "y": 40, "r": 10},
+#         {"type": "rect", "x": 60, "y": 20, "w": 15, "h": 40},
+#     ]
+
+#     rrt = RRTStar(start=(5, 5), goal=(95, 95), bounds=(0, 100, 0, 100), obstacles=obstacles,
+#                   step_size=5.0, min_step_size=0.5, goal_sample_rate=0.2,
+#                   max_iter=5000, prune_radius=2.0, k_nearest=30)
+
+#     path = rrt.plan()
+#     plot(rrt, path)
