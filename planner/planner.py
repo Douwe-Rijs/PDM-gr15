@@ -2,8 +2,6 @@
 """
 Optimized RRT* in 2D with:
 - Cached and incrementally updated KD-tree
-- Reduced list comprehensions and caching of node points
-- Much faster ellipse sampling (true Informed RRT*)
 - Decreasing step size and adaptive goal sampling
 - Node pruning using KD-tree clustering
 """
@@ -71,30 +69,20 @@ class DynamicKDTree:
     def __init__(self):
         self.points = []
         self.tree = None
-        self.dirty = True
 
     def add(self, point):
         self.points.append(point)
-        self.dirty = True
-
-    def rebuild(self):
-        self.tree = KDTree(self.points) if self.points else None
-        self.dirty = False
-
-    def ensure(self):
-        if self.dirty:
-            self.rebuild()
 
     def query(self, point):
-        self.ensure()
+        self.tree = KDTree(self.points) if self.points else None
         return self.tree.query(point)
 
     def query_k(self, point, k):
-        self.ensure()
+        self.tree = KDTree(self.points) if self.points else None
         return self.tree.query(point, k)
 
     def query_radius(self, point, r):
-        self.ensure()
+        self.tree = KDTree(self.points) if self.points else None
         return self.tree.query_ball_point(point, r)
 
 
@@ -103,7 +91,7 @@ class RRTStar:
                  step_size=5.0,
                  min_step_size=0.5,
                  goal_sample_rate=0.1,
-                 max_iter=3000,
+                 max_iter=1000,
                  prune_radius=1.0,
                  k_nearest=20):
 
@@ -116,6 +104,7 @@ class RRTStar:
         self.initial_step = step_size
         self.min_step_size = min_step_size
         self.goal_sample_rate = goal_sample_rate
+        self.goal_radius = 1
         self.goal_found = False
         self.c_best = float("inf")
 
@@ -157,7 +146,6 @@ class RRTStar:
         unit = np.array([r * math.cos(t), r * math.sin(t)])
 
         # Map to ellipse
-        point = self.R_ellipse @ np.array([a, 0]) * 0  # keep shape stable
         mapped = self.R_ellipse @ (np.array([a, b]) * unit) + self.focal_mid
         x, y = mapped
 
@@ -255,7 +243,7 @@ class RRTStar:
                 self.prune_nodes()
 
             # goal connect
-            if dist(q_new_pt, self.goal.point) < step:
+            if dist(q_new_pt, self.goal.point) < self.goal_radius:
                 if collision_free(q_new_pt, self.goal.point, self.obstacles):
                     self.goal_found = True
                     self.goal.parent = q_new
@@ -311,6 +299,8 @@ if __name__ == "__main__":
     obstacles = [
         {"type": "circle", "x": 40, "y": 40, "r": 10},
         {"type": "rect", "x": 60, "y": 20, "w": 15, "h": 40},
+        {"type": "rect", "x": 50, "y": 70, "w": 20, "h": 10},
+        {"type": "circle", "x": 90, "y": 85, "r": 8}
     ]
 
     rrt = RRTStar(start=(5, 5), goal=(95, 95),
