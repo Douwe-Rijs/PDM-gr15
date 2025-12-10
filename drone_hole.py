@@ -3,7 +3,8 @@ import numpy as np
 import pybullet as p
 
 from make_wall import spawn_wall_with_hole, create_ceiling
-from check_point import is_point_in_obstacle
+from kino_dynamic_planner import rrt
+from check_point import draw_debug_point
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
@@ -12,14 +13,16 @@ import numpy as np
 
 if __name__ == "__main__":
     #### Settings ##############################################################
-    walls = 10  # Number of walls to create
-    max_wall_dist = 1
-    min_wall_dist = 0.1
+    walls = 4  # Number of walls to create
+    max_wall_dist = 2
+    min_wall_dist = 1
     thickness = 0.1
     wall_height = 2.0
     wall_width = 1.0
-    hole_width =0.2
-    hole_height = 0.2
+    hole_width =0.5
+    hole_height = 0.7
+    padding = 0.1
+    
 
 
 
@@ -32,6 +35,7 @@ if __name__ == "__main__":
         gui=True,
         record=False,
         obstacles=False,
+        user_debug_gui = False
     )
     #### Create PID controller #################################################
     ctrl = DSLPIDControl(drone_model=DroneModel.CF2X)
@@ -55,38 +59,59 @@ if __name__ == "__main__":
         # Load walls 
     for body_id in (create_ceiling(thickness, walls, max_wall_dist, wall_height, min_wall_dist, wall_width)):
         body_ids.append(body_id)
-
+    print(body_ids)
     #### Hover target position #################################################
     target_pos = np.array([0.0, 0.0, 1.0])
     target_rpy = np.array([0.0, 0.0, 0.0])
 
     action = np.zeros((1, 4))
-    print(body_ids)
 
+    #### Create rrt path #######################################################    
+    draw_debug_point([0, walls*max_wall_dist+1, wall_height/2], size = 10, color=[2,2,2])
+    path = rrt(              start=[0,0,1,0,0,0],
+                             goal=[0, walls*max_wall_dist+1, wall_height/2],
+                             bounds=[(-wall_width/2,wall_width/2),(-1,walls*max_wall_dist),(0,wall_height)],
+                             obstacles = body_ids,
+                             padding = padding)
+    print(path)
+    # assert path != None, "could not find path"
+    path_xyz = path[:, :3]   # Extract only positions (x,y,z)
+    for i in range(len(path_xyz) - 1):
+        p1 = path_xyz[i]
+        p2 = path_xyz[i + 1]
+        p.addUserDebugLine(p1, p2, [0, 1, 0], lineWidth=3)
     #### Run simulation ########################################################
-    while True:
-        t = time.time()
-        target_pos[0] = 0.5 * np.sin(1 * t)
-        target_pos[1] = 0.5 * np.cos(1 * t)
-        state = obs[0]   # 1D array of length 20
+    # Follow the RRT path using interpolation
+    for i in range(len(path) - 1):
 
-        # Compute PID motor RPMs
-        rpm, _, _ = ctrl.computeControlFromState(
-            control_timestep=env.CTRL_TIMESTEP,
-            state=state,
-            target_pos=target_pos,
-            target_rpy=target_rpy
-        )
+        p0 = path[i, :3]      # start point of segment
+        p1 = path[i+1, :3]    # end point of segment
 
-        action[0, :] = rpm
+        # Generate 100 interpolated positions between p0 and p1
+        for t_step in range(100):
+            alpha = t_step / 100.0
+            target_pos = (1 - alpha) * p0 + alpha * p1
+            
+            # Keep fixed yaw
+            target_rpy = np.array([0.0, 0.0, 0.0])
 
-        # Step simulation
-        obs, reward, terminated, truncated, info = env.step(action)
-        env.render()
+            state = obs[0]
 
-        time.sleep(1.0 / env.PYB_FREQ)
+            # Compute PID control
+            rpm, _, _ = ctrl.computeControlFromState(
+                control_timestep=env.CTRL_TIMESTEP,
+                state=state,
+                target_pos=target_pos,
+                target_rpy=target_rpy
+            )
+            action[0, :] = rpm
 
-        if terminated or truncated:
-            break
+            obs, reward, terminated, truncated, info = env.step(action)
+            env.render()
+            time.sleep(1.0 / env.PYB_FREQ)
+
+            if terminated or truncated:
+                break
+
 
     env.close()
