@@ -10,22 +10,15 @@ from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
 import trimesh
 import numpy as np
-
-if __name__ == "__main__":
-    #### Settings ##############################################################
-    walls = 4  # Number of walls to create
-    max_wall_dist = 2
-    min_wall_dist = 1
-    thickness = 0.1
-    wall_height = 2.0
-    wall_width = 1.0
-    hole_width =0.5
-    hole_height = 0.7
-    padding = 0.1
-    
-
-
-
+def run_sim(walls = 4,  # Number of walls to create
+    max_wall_dist = 2,
+    min_wall_dist = 1,
+    thickness = 0.1,
+    wall_height = 2.0,
+    wall_width = 1.0,
+    hole_width =0.5,
+    hole_height = 0.7,
+    padding = 0.1):
     #### Create environment ####################################################
     env = CtrlAviary(
         drone_model=DroneModel.CF2X,
@@ -114,4 +107,29 @@ if __name__ == "__main__":
                 break
 
 
+    try:
+        p.removeAllUserDebugItems()
+    except Exception:
+        pass
+
+    time.sleep(0.1)
+
+    # Explicitly disconnect pybullet (only if you're connected directly)
     env.close()
+    # extra short pause then exit
+    return info, reward
+if __name__ == "__main__":
+    #### Settings ##############################################################
+    run_sim(walls = 4,
+    max_wall_dist = 2,
+    min_wall_dist = 1,
+    thickness = 0.1,
+    wall_height = 2.0,
+    wall_width = 1.0,
+    hole_width =0.5,
+    hole_height = 0.7,
+    padding = 0.1)
+
+
+
+    

@@ -98,7 +98,7 @@ def rrt(start, goal, obstacles, bounds, max_iter=50000, step_size=0.5, goal_thre
         new_pos = nn.pos + direction * min(step_size, dist)
 
         # collision check
-        if line_collides(nn.pos, new_pos, obstacles, padding):
+        if line_collides(nn.pos, new_pos, obstacles, padding= padding):
             continue
 
         # add node

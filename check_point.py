@@ -1,6 +1,6 @@
 import pybullet as p
 
-def is_point_in_obstacle(point, obstacle_ids, padding):
+def is_point_in_obstacle(point, obstacle_ids, padding=0.15):
     for body in obstacle_ids:
         aabb_min, aabb_max = p.getAABB(body)
         if point_in_aabb(point, aabb_min, aabb_max, padding):
