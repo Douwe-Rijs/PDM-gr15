@@ -175,7 +175,7 @@ def rrt(start, goal, obstacles, bounds, max_iter=5000, goal_thresh=1.0):
                                np.random.uniform(zmin, zmax)])
 
         near = nearest(nodes, sample)
-        control = sample_random_control()
+        control = sample_random_control(0.5)
         traj, new_state = propagate(near.state, control)
 
         if trajectory_collides(traj, obstacles):
@@ -209,6 +209,8 @@ if __name__ == "__main__":
     bounds = ((-5, 15), (-5, 15), (0, 6))
 
     path = rrt(start, goal, obstacles, bounds)
+    print(type(path))
+    print(path.shape)
 
     if path is not None:
         print("Path (states):")

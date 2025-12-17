@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Optimized RRT* in 2D with:
+Optimized RRT* in 3D with:
 - Cached and incrementally updated KD-tree
 - Decreasing step size and adaptive goal sampling
 - Node pruning using KD-tree clustering
+- Elliptical informed sampling in 3D
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial import KDTree
 import math
 import random
@@ -16,40 +18,59 @@ import random
 # Utility functions
 # -------------------------------------------------------------
 def dist(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+    """Euclidean distance for 2D or 3D points."""
+    a = np.array(a)
+    b = np.array(b)
+    return float(np.linalg.norm(a - b))
 
 
 def steer(from_node, to_point, step):
-    fx, fy = from_node
-    tx, ty = to_point
-    dx, dy = tx - fx, ty - fy
-    d = math.hypot(dx, dy)
+    """Steer from from_node towards to_point, limited by step size."""
+    from_arr = np.array(from_node)
+    to_arr = np.array(to_point)
+    direction = to_arr - from_arr
+    d = np.linalg.norm(direction)
     if d <= step:
-        return to_point
-    s = step / d
-    return (fx + s * dx, fy + s * dy)
+        return tuple(to_point)
+    normalized = direction / d
+    return tuple(from_arr + step * normalized)
 
 
 def inside_obstacle(point, obstacles):
-    x, y = point
+    """Check if a point is inside any obstacle (2D or 3D)."""
     for obs in obstacles:
         t = obs["type"]
-        if t == "circle":
-            if dist(point, (obs["x"], obs["y"])) <= obs["r"]:
+        if t == "sphere":
+            center = tuple(obs[k] for k in ["x", "y", "z"])
+            if dist(point, center) <= obs["r"]:
+                return True
+        elif t == "circle":
+            # 2D obstacle in 3D space (at some z-level)
+            center_2d = (obs["x"], obs["y"])
+            point_2d = point[:2] if len(point) > 2 else point
+            if dist(point_2d, center_2d) <= obs["r"]:
+                return True
+        elif t == "box":
+            # 3D axis-aligned box
+            if (obs["x"] <= point[0] <= obs["x"] + obs["w"] and
+                obs["y"] <= point[1] <= obs["y"] + obs["h"] and
+                obs["z"] <= point[2] <= obs["z"] + obs["d"]):
                 return True
         elif t == "rect":
-            if obs["x"] <= x <= obs["x"] + obs["w"] and obs["y"] <= y <= obs["y"] + obs["h"]:
+            # 2D rectangle in 3D space
+            if (obs["x"] <= point[0] <= obs["x"] + obs["w"] and
+                obs["y"] <= point[1] <= obs["y"] + obs["h"]):
                 return True
     return False
 
 
 def collision_free(p1, p2, obstacles, resolution=10):
-    x1, y1 = p1
-    x2, y2 = p2
+    """Check if path between p1 and p2 is collision-free."""
+    p1_arr = np.array(p1)
+    p2_arr = np.array(p2)
     for t in np.linspace(0, 1, resolution):
-        x = x1 + t * (x2 - x1)
-        y = y1 + t * (y2 - y1)
-        if inside_obstacle((x, y), obstacles):
+        point = p1_arr + t * (p2_arr - p1_arr)
+        if inside_obstacle(tuple(point), obstacles):
             return False
     return True
 
@@ -118,17 +139,13 @@ class RRTStar:
         self.kdtree = DynamicKDTree()
         self.kdtree.add(start)
 
-        # Precompute ellipse rotation
-        s = np.array(start)
-        g = np.array(goal)
-        direction = (g - s) / np.linalg.norm(g - s)
-        angle = math.atan2(direction[1], direction[0])
-        self.R_ellipse = np.array([[math.cos(angle), -math.sin(angle)],
-                                   [math.sin(angle),  math.cos(angle)]])
-        self.focal_mid = (s + g) / 2.0
-        self.c_min = np.linalg.norm(g - s)
+        # Precompute ellipse rotation in 3D
+        self.start_arr = np.array(start)
+        self.goal_arr = np.array(goal)
+        self.c_min = np.linalg.norm(self.goal_arr - self.start_arr)
+        self.focal_mid = (self.start_arr + self.goal_arr) / 2.0
 
-    # ---- Optimized Informed RRT* ellipse sampling ----
+    # ---- Optimized Informed RRT* ellipse sampling in 3D ----
     def sample_in_ellipse(self):
         if not self.goal_found:
             return None
@@ -136,22 +153,42 @@ class RRTStar:
         if c_best < self.c_min:
             return None
 
-        # Semi-major/minor axes
-        a = c_best / 2
-        b = math.sqrt(c_best**2 - self.c_min**2) / 2
-
-        # Sample within unit circle
-        r = math.sqrt(random.random())
-        t = random.random() * 2 * math.pi
-        unit = np.array([r * math.cos(t), r * math.sin(t)])
-
-        # Map to ellipse
-        mapped = self.R_ellipse @ (np.array([a, b]) * unit) + self.focal_mid
-        x, y = mapped
-
-        bx1, bx2, by1, by2 = self.bounds
-        if bx1 <= x <= bx2 and by1 <= y <= by2:
-            return (float(x), float(y))
+        # Semi-major/minor axes in 3D
+        a = c_best / 2.0
+        b = math.sqrt(max(0, c_best**2 - self.c_min**2)) / 2.0
+        
+        # Sample uniformly in a ball
+        r = (random.random()) ** (1/3)  # Uniform in 3D ball
+        phi = random.random() * 2 * math.pi
+        cos_theta = random.random() * 2 - 1
+        sin_theta = math.sqrt(max(0, 1 - cos_theta**2))
+        
+        # Map to ellipsoid: use first 2 dims as ellipse, 3rd dim as smaller
+        x = a * r * math.cos(phi) * sin_theta
+        y = b * r * math.sin(phi) * sin_theta
+        z = b * r * cos_theta
+        unit = np.array([x, y, z])
+        
+        # Direction from start to goal
+        direction = self.goal_arr - self.start_arr
+        norm_dir = direction / self.c_min
+        
+        # Build orthonormal basis
+        if abs(norm_dir[2]) < 0.99:
+            v1 = np.array([-norm_dir[1], norm_dir[0], 0])
+            v1 = v1 / np.linalg.norm(v1)
+        else:
+            v1 = np.array([1, 0, 0])
+        v2 = np.cross(norm_dir, v1)
+        v2 = v2 / np.linalg.norm(v2)
+        
+        # Rotate unit sample to world space
+        mapped = norm_dir * unit[0] + v1 * unit[1] + v2 * unit[2] + self.focal_mid
+        
+        bx1, bx2, by1, by2, bz1, bz2 = self.bounds
+        if (bx1 <= mapped[0] <= bx2 and by1 <= mapped[1] <= by2 and 
+            bz1 <= mapped[2] <= bz2):
+            return tuple(mapped)
         return None
 
     def random_sample(self):
@@ -167,8 +204,8 @@ class RRTStar:
             if random.random() < self.goal_sample_rate:
                 return self.goal.point
 
-        bx1, bx2, by1, by2 = self.bounds
-        return (random.uniform(bx1, bx2), random.uniform(by1, by2))
+        bx1, bx2, by1, by2, bz1, bz2 = self.bounds
+        return (random.uniform(bx1, bx2), random.uniform(by1, by2), random.uniform(bz1, bz2))
 
     # ---- Pruning ----
     def prune_nodes(self):
@@ -266,27 +303,98 @@ class RRTStar:
 # Visualization
 # -------------------------------------------------------------
 def plot(rrt, path=None):
-    plt.figure(figsize=(8, 8))
-    for n in rrt.nodes:
-        if n.parent:
-            x1, y1 = n.point
-            x2, y2 = n.parent.point
-            plt.plot([x1, x2], [y1, y2], "k-", linewidth=0.25)
-
-    for obs in rrt.obstacles:
-        if obs["type"] == "circle": plt.gca().add_patch(plt.Circle((obs["x"], obs["y"]), obs["r"], color="gray"))
-        elif obs["type"] == "rect": plt.gca().add_patch(plt.Rectangle((obs["x"], obs["y"]), obs["w"], obs["h"], color="gray"))
-
-    if path:
-        xs, ys = zip(*path)
-        plt.plot(xs, ys, "r-", linewidth=2)
-
-    plt.scatter(*rrt.start.point, c="green", s=60)
-    plt.scatter(*rrt.goal.point, c="red", s=60)
-    bx1, bx2, by1, by2 = rrt.bounds
-    plt.xlim(bx1, bx2)
-    plt.ylim(by1, by2)
-    plt.gca().set_aspect("equal", adjustable="box")
+    """Plot RRT tree and path in 3D or 2D depending on configuration."""
+    fig = plt.figure(figsize=(12, 10))
+    
+    # Check if 3D or 2D
+    is_3d = len(rrt.start.point) == 3
+    
+    if is_3d:
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Plot tree edges
+        for n in rrt.nodes:
+            if n.parent:
+                x1, y1, z1 = n.point
+                x2, y2, z2 = n.parent.point
+                ax.plot([x1, x2], [y1, y2], [z1, z2], "k-", linewidth=0.25, alpha=0.6)
+        
+        # Plot obstacles
+        for obs in rrt.obstacles:
+            if obs["type"] == "sphere":
+                u = np.linspace(0, 2 * np.pi, 30)
+                v = np.linspace(0, np.pi, 20)
+                x = obs["r"] * np.outer(np.cos(u), np.sin(v)) + obs["x"]
+                y = obs["r"] * np.outer(np.sin(u), np.sin(v)) + obs["y"]
+                z = obs["r"] * np.outer(np.ones(np.size(u)), np.cos(v)) + obs["z"]
+                ax.plot_surface(x, y, z, color="gray", alpha=0.3)
+            elif obs["type"] == "box":
+                # Draw box wireframe
+                x_min, x_max = obs["x"], obs["x"] + obs["w"]
+                y_min, y_max = obs["y"], obs["y"] + obs["h"]
+                z_min, z_max = obs["z"], obs["z"] + obs["d"]
+                vertices = [
+                    [x_min, y_min, z_min], [x_max, y_min, z_min],
+                    [x_max, y_max, z_min], [x_min, y_max, z_min],
+                    [x_min, y_min, z_max], [x_max, y_min, z_max],
+                    [x_max, y_max, z_max], [x_min, y_max, z_max]
+                ]
+                vertices = np.array(vertices)
+                # Draw edges
+                edges = [
+                    [0, 1], [1, 2], [2, 3], [3, 0],  # bottom
+                    [4, 5], [5, 6], [6, 7], [7, 4],  # top
+                    [0, 4], [1, 5], [2, 6], [3, 7]   # vertical
+                ]
+                for edge in edges:
+                    pts = vertices[edge]
+                    ax.plot3D(*pts.T, "gray", linewidth=2, alpha=0.6)
+        
+        # Plot path
+        if path:
+            xs, ys, zs = zip(*path)
+            ax.plot(xs, ys, zs, "r-", linewidth=3, label="Path")
+        
+        # Plot start and goal
+        ax.scatter(*rrt.start.point, c="green", s=100, label="Start", marker="o")
+        ax.scatter(*rrt.goal.point, c="red", s=100, label="Goal", marker="*")
+        
+        bx1, bx2, by1, by2, bz1, bz2 = rrt.bounds
+        ax.set_xlim(bx1, bx2)
+        ax.set_ylim(by1, by2)
+        ax.set_zlim(bz1, bz2)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.legend()
+    else:
+        # 2D visualization
+        ax = fig.add_subplot(111)
+        
+        for n in rrt.nodes:
+            if n.parent:
+                x1, y1 = n.point
+                x2, y2 = n.parent.point
+                ax.plot([x1, x2], [y1, y2], "k-", linewidth=0.25)
+        
+        for obs in rrt.obstacles:
+            if obs["type"] == "circle":
+                ax.add_patch(plt.Circle((obs["x"], obs["y"]), obs["r"], color="gray", alpha=0.5))
+            elif obs["type"] == "rect":
+                ax.add_patch(plt.Rectangle((obs["x"], obs["y"]), obs["w"], obs["h"], color="gray", alpha=0.5))
+        
+        if path:
+            xs, ys = zip(*path)
+            ax.plot(xs, ys, "r-", linewidth=2)
+        
+        ax.scatter(*rrt.start.point, c="green", s=100, label="Start")
+        ax.scatter(*rrt.goal.point, c="red", s=100, label="Goal")
+        bx1, bx2, by1, by2 = rrt.bounds[:4]
+        ax.set_xlim(bx1, bx2)
+        ax.set_ylim(by1, by2)
+        ax.set_aspect("equal", adjustable="box")
+        ax.legend()
+    
     plt.show()
 
 # -------------------------------------------------------------
@@ -296,20 +404,27 @@ if __name__ == "__main__":
     random.seed(0)
     np.random.seed(0)
 
-    obstacles = [
-        {"type": "circle", "x": 40, "y": 40, "r": 10},
-        {"type": "rect", "x": 60, "y": 20, "w": 15, "h": 40},
-        {"type": "rect", "x": 50, "y": 70, "w": 20, "h": 10},
-        {"type": "circle", "x": 90, "y": 85, "r": 8}
+    # Example 3D planning
+    obstacles_3d = [
+        {"type": "sphere", "x": 40, "y": 40, "z": 40, "r": 10},
+        {"type": "box", "x": 60, "y": 20, "z": 30, "w": 15, "h": 40, "d": 20},
+        {"type": "box", "x": 50, "y": 70, "z": 50, "w": 20, "h": 10, "d": 15},
+        {"type": "sphere", "x": 90, "y": 85, "z": 60, "r": 8}
     ]
 
-    rrt = RRTStar(start=(5, 5), goal=(95, 95),
-                  bounds=(0, 100, 0, 100), obstacles=obstacles,
+    rrt = RRTStar(start=(5, 5, 5), goal=(95, 95, 90),
+                  bounds=(0, 100, 0, 100, 0, 100), obstacles=obstacles_3d,
                   step_size=5.0, min_step_size=0.5, goal_sample_rate=0.2,
                   max_iter=5000, prune_radius=2.0, k_nearest=40)
 
     path = rrt.plan()
     plot(rrt, path)
+    
+    if path:
+        print(f"Path found with {len(path)} waypoints")
+        print(f"Path cost: {rrt.goal.cost:.2f}")
+    else:
+        print("No path found")
 
 
 # #!.venv/bin/python3
