@@ -3,7 +3,9 @@ import numpy as np
 import pybullet as p
 
 from make_wall import spawn_wall_with_hole, create_ceiling
-from kino_dynamic_planner import rrt
+# from planner.kino_dynamic_rrt import rrt
+from planner.opt_rrt import rrt
+# from kino_dynamic_planner import rrt
 from check_point import draw_debug_point
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
@@ -66,7 +68,7 @@ def run_sim(walls = 4,  # Number of walls to create
                              bounds=[(-wall_width/2,wall_width/2),(-1,walls*max_wall_dist),(0,wall_height)],
                              obstacles = body_ids,
                              padding = padding)
-    print(path)
+    
     # assert path != None, "could not find path"
     path_xyz = path[:, :3]   # Extract only positions (x,y,z)
     for i in range(len(path_xyz) - 1):
